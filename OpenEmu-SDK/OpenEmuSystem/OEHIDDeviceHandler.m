@@ -32,6 +32,7 @@
 #import "OEDeviceManager.h"
 #import "OEDeviceManager_Internal.h"
 #import "OEHIDDeviceParser.h"
+#import "OEDualSenseBluetoothReport.h"
 #import <IOKit/usb/USBSpec.h>
 
 NS_ASSUME_NONNULL_BEGIN
@@ -54,6 +55,7 @@ NS_ASSUME_NONNULL_BEGIN
     FFEffectObjectReference _effectRef;
 
     BOOL _isFunctionKeyPressed;
+    NSArray *_dualSenseBluetoothElements;
 }
 
 + (id<OEHIDDeviceParser>)deviceParser;
@@ -225,8 +227,43 @@ NS_ASSUME_NONNULL_BEGIN
     return [OEHIDEvent eventWithDeviceHandler:self value:aValue];
 }
 
+// Return YES when a vendor-defined report was consumed (including malformed
+// reports), so it never reaches the generic single-control HID value parser.
+- (BOOL)OE_dispatchDualSenseBluetoothValue:(IOHIDValueRef)aValue
+{
+    IOHIDElementRef element = IOHIDValueGetElement(aValue);
+    if(IOHIDElementGetUsagePage(element) != 0xFF00
+       || IOHIDElementGetUsage(element) != 0x3B
+       || IOHIDElementGetReportID(element) != 0x31)
+        return NO;
+
+    OEDualSenseBluetoothState state;
+    if(!OEDecodeDualSenseBluetoothReport(IOHIDElementGetReportID(element),
+                                        IOHIDValueGetBytePtr(aValue),
+                                        IOHIDValueGetLength(aValue), &state))
+        return YES;
+
+    for(id object in _dualSenseBluetoothElements) {
+        IOHIDElementRef control = (__bridge IOHIDElementRef)object;
+        int value;
+        if(!OEDualSenseBluetoothValueForUsage(&state, IOHIDElementGetUsagePage(control),
+                                            IOHIDElementGetUsage(control), &value))
+            continue;
+        IOHIDValueRef translated = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, control,
+                                                                  IOHIDValueGetTimeStamp(aValue), value);
+        if(translated != NULL) {
+            [self dispatchEvent:[self eventWithHIDValue:translated]];
+            CFRelease(translated);
+        }
+    }
+    return YES;
+}
+
 - (void)dispatchEventWithHIDValue:(IOHIDValueRef)aValue
 {
+    if(_dualSenseBluetoothElements.count != 0 && [self OE_dispatchDualSenseBluetoothValue:aValue])
+        return;
+
     OEHIDEvent *event = [self eventWithHIDValue:aValue];
     if (event.type == OEHIDEventTypeKeyboard && event.keycode == OEHIDUsage_KeyboardFunctionKey) {
         _isFunctionKeyPressed = (event.state == OEHIDEventStateOn);
@@ -361,7 +398,7 @@ NS_ASSUME_NONNULL_BEGIN
 
     // Register for input
     NOTE("If supporting additional HID Usage Pages add them here to whitelist!");
-    IOHIDDeviceSetInputValueMatchingMultiple(_device, (__bridge CFArrayRef)@[
+    NSMutableArray *matching = [@[
         @{ @kIOHIDElementUsagePageKey: @(kHIDPage_GenericDesktop) },
         @{ @kIOHIDElementUsagePageKey: @(kHIDPage_Consumer) },
         @{ @kIOHIDElementUsagePageKey: @(kHIDPage_Simulation) },
@@ -371,7 +408,32 @@ NS_ASSUME_NONNULL_BEGIN
         @{ @kIOHIDElementUsagePageKey: @(kHIDPage_Button) },
         @{ @kIOHIDElementUsagePageKey: @(kHIDPage_KeyboardOrKeypad) },
         @{ @kIOHIDElementUsagePageKey: @0xFF, @kIOHIDElementUsageKey: @3, }
-    ]);
+    ] mutableCopy];
+
+    // Enhanced Bluetooth reports expose a vendor-defined payload instead of
+    // individual buttons/axes (see #730). Keep USB and other controllers on
+    // the existing path, and reuse the DualSense's simple-report elements.
+    NSNumber *vendor = (__bridge id)IOHIDDeviceGetProperty(_device, CFSTR(kIOHIDVendorIDKey));
+    NSNumber *product = (__bridge id)IOHIDDeviceGetProperty(_device, CFSTR(kIOHIDProductIDKey));
+    NSString *transport = (__bridge id)IOHIDDeviceGetProperty(_device, CFSTR(kIOHIDTransportKey));
+    if(vendor.unsignedIntValue == 0x054C && product.unsignedIntValue == 0x0CE6
+       && [transport isEqualToString:@kIOHIDTransportBluetoothValue]) {
+        NSArray *elements = CFBridgingRelease(IOHIDDeviceCopyMatchingElements(_device, NULL, 0));
+        NSMutableArray *controls = [NSMutableArray array];
+        for(id object in elements) {
+            IOHIDElementRef element = (__bridge IOHIDElementRef)object;
+            uint32_t page = IOHIDElementGetUsagePage(element);
+            IOHIDElementType type = IOHIDElementGetType(element);
+            if(IOHIDElementGetReportID(element) == 0x01
+               && (page == kHIDPage_GenericDesktop || page == kHIDPage_Button)
+               && type >= kIOHIDElementTypeInput_Misc && type <= kIOHIDElementTypeInput_ScanCodes)
+                [controls addObject:object];
+        }
+        _dualSenseBluetoothElements = [controls copy];
+        if(_dualSenseBluetoothElements.count != 0)
+            [matching addObject:@{ @kIOHIDElementUsagePageKey: @0xFF00, @kIOHIDElementUsageKey: @0x3B }];
+    }
+    IOHIDDeviceSetInputValueMatchingMultiple(_device, (__bridge CFArrayRef)matching);
     IOHIDDeviceRegisterInputValueCallback(_device, OEHandle_InputValueCallback, (__bridge void *)self);
 
     // Attach to the runloop
