@@ -21,6 +21,9 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "../OpenEmuSystem/OEDualSenseBluetoothReport.h"
+#ifdef NDEBUG
+#error "These tests require assertions; compile with -UNDEBUG."
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <zlib.h>
@@ -63,12 +66,37 @@ int main(void)
         assert(OEDualSenseBluetoothValueForUsage(&state, 1, usages[axis], &value));
         assert(value == axes[axis]);
     }
-    for(unsigned hat = 0; hat <= 8; hat++) {
+    for(unsigned hat = 0; hat <= 15; hat++) {
         payload[8] = (uint8_t)hat;
         seal(payload);
         assert(OEDecodeDualSenseBluetoothReport(0x31, payload, sizeof(payload), &state));
-        assert(OEDualSenseBluetoothValueForUsage(&state, 1, 0x39, &value) && value == (int)hat);
+        assert(OEDualSenseBluetoothValueForUsage(&state, 1, 0x39, &value) && value == (int)(hat < 8 ? hat : 8));
     }
+    // First packet emits neutral values; duplicates emit nothing. Press and
+    // release must both be emitted, and changes to one field leave others quiet.
+    OEDualSenseBluetoothState previous = state;
+    assert(OEDualSenseBluetoothChangedValueForUsage(&state, NULL, 9, 1, &value));
+    assert(!OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 9, 1, &value));
+    state.buttons = 1;
+    assert(OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 9, 1, &value) && value == 1);
+    assert(!OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 9, 2, &value));
+    previous = state;
+    state.buttons = 0;
+    assert(OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 9, 1, &value) && value == 0);
+    previous = state;
+    for(unsigned axis = 0; axis < 6; axis++) {
+        state.axes[axis] ^= 1;
+        for(unsigned other = 0; other < 6; other++)
+            assert(OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 1, usages[other], &value)
+                   == (axis == other));
+        previous = state;
+    }
+    state.hatSwitch = 2;
+    assert(OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 1, 0x39, &value) && value == 2);
+    previous = state;
+    state.hatSwitch = 8;
+    assert(OEDualSenseBluetoothChangedValueForUsage(&state, &previous, 1, 0x39, &value) && value == 8);
+    assert(!OEDualSenseBluetoothChangedValueForUsage(&state, NULL, 9, 15, &value));
     assert(!OEDualSenseBluetoothValueForUsage(&state, 9, 0, &value));
     assert(!OEDualSenseBluetoothValueForUsage(&state, 9, 15, &value));
     assert(!OEDualSenseBluetoothValueForUsage(&state, 0xFF00, 0x3B, &value));
